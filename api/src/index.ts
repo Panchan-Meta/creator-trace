@@ -1,4 +1,5 @@
 import {projectInvitesRoute,expireInvites} from './project-invites';
+import {accountActivationsRoute,expireAccountActivations} from './account-activations';
 import {botReviewsRoute} from './bot-reviews';
 import { z } from 'zod';
 import {requireAdmin} from './admin';
@@ -13,7 +14,7 @@ import {refreshProofs} from './timestamps';
 async function route(request:Request,env:Bindings):Promise<Response> {
  const path=new URL(request.url).pathname;
  if(path.startsWith('/mcp/')||/^\/api\/(issuance-batches|certificates|my|internal)(\/|$)/.test(path))throw new HttpError(410,'旧サービスは利用を停止しました');
- if(/^\/admin\/inquiries(?:\/|$)/.test(path))await requireAdmin(request,new Store(env));
+ if(/^\/admin\/(inquiries|users)(?:\/|$)/.test(path))await requireAdmin(request,new Store(env),path.startsWith('/admin/users')?'利用者管理の権限がありません':'問い合わせ管理の権限がありません');
  if(!path.startsWith('/api/'))return env.ASSETS?env.ASSETS.fetch(request):new Response('Creator Trace');
  if(!['GET','POST'].includes(request.method)&&!(request.method==='PATCH'&&/^\/api\/admin\/inquiries\/[^/]+\/status$/.test(path)))throw new HttpError(405,'Method not allowed');
  if(['POST','PATCH'].includes(request.method)) {
@@ -23,6 +24,7 @@ async function route(request:Request,env:Bindings):Promise<Response> {
  const s=new Store(env),key=await sha256(`${request.headers.get('CF-Connecting-IP')??'local'}:${path.startsWith('/api/auth/')?'auth':'api'}`),epoch=Math.floor(Date.now()/60000);
  const rate=await s.sql('INSERT INTO rate_limits(key,count,reset_at) VALUES(?,1,?) ON CONFLICT(key) DO UPDATE SET count=CASE WHEN reset_at=excluded.reset_at THEN count+1 ELSE 1 END,reset_at=excluded.reset_at RETURNING count',key,epoch).first<{count:number}>();
  if(rate!.count>(path.startsWith('/api/auth/')?30:240))throw new HttpError(429,'しばらく待ってからお試しください');
+ const activation=await accountActivationsRoute(request,env);if(activation)return activation;
  if(path.startsWith('/api/auth/')&&path!=='/api/auth/owner-session')return auth(request,env,path);
  if(path.startsWith('/api/v1/'))return publicAPI(request,env);
  const inquiry=await inquiriesRoute(request,env);if(inquiry)return inquiry;
@@ -32,7 +34,7 @@ async function route(request:Request,env:Bindings):Promise<Response> {
  return creatorRoute(request,env);
 }
 export default {
- async scheduled(_event:ScheduledController,env:Bindings,ctx:ExecutionContext){ctx.waitUntil(refreshProofs(env));ctx.waitUntil(expireInvites(env));},
+ async scheduled(_event:ScheduledController,env:Bindings,ctx:ExecutionContext){ctx.waitUntil(refreshProofs(env));ctx.waitUntil(expireInvites(env));ctx.waitUntil(expireAccountActivations(env));},
  async fetch(request:Request,env:Bindings):Promise<Response> {
   let response:Response;
   try {

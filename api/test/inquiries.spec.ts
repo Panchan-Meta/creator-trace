@@ -28,7 +28,7 @@ it('匿名問い合わせ登録と管理者一覧・詳細、ステータス変�
 it('同名Punkaや全案件役割でも管理権限がなければ全管理APIを403にする',async()=>{
  for(const user of Object.values(users))for(const [path,method,body] of [['/api/admin/access','GET',undefined],['/api/admin/inquiries','GET',undefined],[`/api/admin/inquiries/${id()}`,'GET',undefined],[`/api/admin/inquiries/${id()}/status`,'PATCH',{status:'COMPLETED'}]] as const)expect((await req(path,method,body,user)).status).toBe(403);
  expect((await req('/api/admin/inquiries','GET',undefined,null)).status).toBe(401);
- const signup=await req('/api/auth/signup','POST',{name:'Punka',project_name:'Self service',is_admin:true},null);expect(signup.status).toBe(400);
+ const signup=await req('/api/auth/signup','POST',{name:'Punka',project_name:'Self service',is_admin:true},null);expect(signup.status).toBe(410);
 });
 it('NEW優先・受付日時降順、アーカイブ除外、PATCHのOriginと入力を検証する',async()=>{
  const records=[['old-new','NEW','2026-01-01'],['recent-done','COMPLETED','2026-10-01'],['recent-new','NEW','2026-09-01'],['archived','NEW','2026-10-02']];

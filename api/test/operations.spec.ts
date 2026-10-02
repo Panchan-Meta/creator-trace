@@ -81,11 +81,11 @@ it('招待は期限・一回利用・Passkeyを要求し平文tokenを保存し�
  expect((await req('/api/project-invites/accept',{token:'invalid'},'OUTSIDER')).status).toBe(400);expect((await req('/api/project-invites/accept',{token,display_name:'Outside member'},'OUTSIDER')).status).toBe(200);expect((await req('/api/project-invites/accept',{token,display_name:'Outside member'},'OUTSIDER')).status).toBe(400);
  const expired=await (await req(`/api/projects/${project}/invites`,{email:'x@example.com',role:'CREATOR'})).json() as any;await env.DB.prepare('UPDATE project_invites SET expires_at=? WHERE id=?').bind('2000-01-01',expired.id).run();expect((await req('/api/project-invites/accept',{token:expired.url.split('/').at(-1)},'OUTSIDER')).status).toBe(410);
 });
-it('複数Passkeyの削除と最終credential保護、セルフサービス登録options',async()=>{
+it('複数Passkeyの削除と最終credential保護、既存ユーザーの登録options',async()=>{
  expect((await req('/api/auth/passkeys/viewer-key/remove',{},'OUTSIDER')).status).toBe(409);
  await env.DB.prepare('INSERT INTO webauthn_credentials(id,recipient_id,public_key,counter,transports_json,created_at) VALUES(?,?,?,?,?,?)').bind('second-key',users.OUTSIDER,'fake-test-key',0,'[]',now()).run();expect((await req('/api/auth/passkeys/second-key/remove',{},'OUTSIDER')).status).toBe(200);
  await expect(env.DB.prepare('DELETE FROM webauthn_credentials WHERE recipient_id=?').bind(users.OUTSIDER).run()).rejects.toThrow();
- const signup=await req('/api/auth/signup',{name:'New creator',project_name:'New music'});expect(signup.status).toBe(201);const token=signup.headers.get('Set-Cookie')!.split(';')[0];
+ const token=`punka_session=${users.OUTSIDER}`;
  const options=await worker.fetch(new Request(bindings.APP_ORIGIN+'/api/auth/passkey/register/options',{method:'POST',headers:{Origin:bindings.APP_ORIGIN,Cookie:token},body:'{}'}),bindings);expect(options.status).toBe(200);const d=await options.json() as any;expect(d.authenticatorSelection.authenticatorAttachment).toBeUndefined();expect(d.authenticatorSelection.userVerification).toBe('required');
  expect((await req('/api/auth/passkey/login/verify',{response:{}})).status).toBe(400);
 });

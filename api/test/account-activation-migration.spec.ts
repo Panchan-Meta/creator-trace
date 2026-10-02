@@ -1,0 +1,20 @@
+import {env,applyD1Migrations} from 'cloudflare:test';
+import {it,expect} from 'vitest';
+import {id,now,sha256,randomToken} from '../src/domain';
+it('0020は既存ADMIN・Passkey・案件・Version・OTS・招待・全履歴を変更しない',async()=>{
+ const migrations=(env as unknown as {TEST_MIGRATIONS:Parameters<typeof applyD1Migrations>[1]}).TEST_MIGRATIONS;
+ await applyD1Migrations(env.DB,migrations.slice(0,-1));
+ const user=id(),project=id(),asset=id(),version=id(),time=now();const sql=(query:string,...args:(string|number|null)[])=>env.DB.prepare(query).bind(...args);
+ await sql('INSERT INTO users(id,display_name,email,created_at) VALUES(?,?,?,?)',user,'Existing Punka','existing@creator.example',time).run();await sql('INSERT INTO site_admins VALUES(?,?)',user,time).run();
+ await sql('INSERT INTO webauthn_credentials(id,recipient_id,public_key,counter,transports_json,created_at,name) VALUES(?,?,?,?,?,?,?)','existing-public-credential',user,'existing-public-key',7,'["internal"]',time,'Existing Passkey').run();
+ await sql('INSERT INTO sessions VALUES(?,?,?)',await sha256(randomToken()),user,new Date(Date.now()+86400000).toISOString()).run();
+ await sql('INSERT INTO projects(id,name,owner_id,created_at) VALUES(?,?,?,?)',project,'Existing project',user,time).run();
+ await sql('INSERT INTO assets(id,project_id,filename,mime_type,size,created_at,created_by) VALUES(?,?,?,?,?,?,?)',asset,project,'existing.wav','audio/wav',4,time,user).run();
+ await sql('INSERT INTO asset_versions(id,asset_id,version,sha256,status,created_by,filename,mime_type,size,created_at) VALUES(?,?,1,?,?,?,?,?,?,?)',version,asset,'4'.repeat(64),'SUBMITTED',user,'existing.wav','audio/wav',4,time).run();
+ await sql('INSERT INTO proofs(id,asset_version_id,sha256,ots_proof,created_at,timestamp_created_at) VALUES(?,?,?,?,?,?)',id(),version,'4'.repeat(64),(env as unknown as {TEST_OTS:string}).TEST_OTS,time,time).run();
+ await sql('INSERT INTO project_invites(id,project_id,token_hash,email,role,created_by,expires_at,created_at) VALUES(?,?,?,?,?,?,?,?)',id(),project,await sha256(randomToken()),'invited@example.com','CREATOR',user,new Date(Date.now()+86400000).toISOString(),time).run();
+ const tables=['users','site_admins','webauthn_credentials','sessions','projects','project_members','project_member_history','assets','asset_versions','proofs','project_invites','approvals','deliveries','delivery_history','audit_events','audit_logs'];
+ const snapshot=async()=>Promise.all(tables.map(async table=>(await sql(`SELECT * FROM ${table} ORDER BY 1`).all()).results));
+ const before=await snapshot();await applyD1Migrations(env.DB,migrations);expect(await snapshot()).toEqual(before);
+ expect((await sql('SELECT * FROM account_activations').all()).results).toEqual([]);
+});
