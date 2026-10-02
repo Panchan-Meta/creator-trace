@@ -6,3 +6,5 @@
 .breadcrumbs{display:flex;flex-wrap:wrap;gap:8px;margin:0 0 16px}.invite-record{border-bottom:1px solid #d9e1e8;padding:16px 0}table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:8px;border-bottom:1px solid #d9e1e8;overflow-wrap:anywhere}
 
 header{flex-wrap:wrap}header nav{flex-wrap:wrap}.account-status{display:flex;align-items:center;flex-wrap:wrap;gap:8px;margin-left:auto;max-width:100%;overflow-wrap:anywhere}.account-status button{margin-right:0}textarea{font:inherit;max-width:100%;padding:10px;border:1px solid #aebdc7;border-radius:6px;background:#fff}textarea:focus-visible{outline:3px solid #d48725;outline-offset:3px}@media(max-width:640px){.account-status{margin-left:0;width:100%}.account-status span{width:100%}}
+
+.termination-dialog{width:min(560px,calc(100vw - 48px));max-height:85vh;overflow:auto;margin:auto;color:inherit}.termination-dialog::backdrop{background:rgba(23,45,60,.35)}

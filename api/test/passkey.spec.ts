@@ -50,14 +50,14 @@ it('停止前の自己登録tokenと登録challengeは再開できず、既存�
 });
 it.each(['provisioned','invite','activation'])('%s: 実署名Passkeyの登録 → ログイン → session → logout、招待再使用を拒否',async mode=>{
  authTestIP=`passkey-flow-${mode}`;
- let invitation:any,ownerProject:string|undefined;
+ let invitation:any,ownerProject:string|undefined,activationAdminCookie:string|undefined;
  if(mode==='invite'){const owner=id(),session=randomToken();await s.sql('INSERT INTO users(id,display_name,created_at) VALUES(?,?,?)',owner,'Punka',now()).run();ownerProject=id();await s.sql('INSERT INTO projects(id,name,owner_id,created_at) VALUES(?,?,?,?)',ownerProject,"Rahab's mission",owner,now()).run();await s.sql('INSERT INTO sessions VALUES(?,?,?)',await sha256(session),owner,new Date(Date.now()+86400000).toISOString()).run();invitation=await (await req(`/api/projects/${ownerProject}/invites`,{email:'mfzb5683rhcp2525@gmail.com',role:'CREATOR'},`punka_session=${session}`)).json();}
  let enrollmentCookie:string,userId:string;
  if(mode==='provisioned'){
   userId=id();const token=randomToken();await s.sql('INSERT INTO users(id,display_name,created_at) VALUES(?,?,?)',userId,'Creator',now()).run();await s.sql('INSERT INTO sessions VALUES(?,?,?)',await sha256(token),userId,new Date(Date.now()+86400000).toISOString()).run();enrollmentCookie=`punka_session=${token}`;
  }else if(mode==='activation'){
   const admin=id(),session=randomToken();await s.sql('INSERT INTO users(id,display_name,created_at) VALUES(?,?,?)',admin,'System admin',now()).run();await s.sql('INSERT INTO site_admins VALUES(?,?)',admin,now()).run();await s.sql('INSERT INTO sessions VALUES(?,?,?)',await sha256(session),admin,new Date(Date.now()+86400000).toISOString()).run();
-  const issued=await req('/api/admin/account-activations',{email:'customer@example.com'},`punka_session=${session}`);expect(issued.status).toBe(201);invitation=await issued.json();enrollmentCookie='';userId='';
+  activationAdminCookie=`punka_session=${session}`;const issued=await req('/api/admin/account-activations',{email:'customer@example.com'},activationAdminCookie);expect(issued.status).toBe(201);invitation=await issued.json();enrollmentCookie='';userId='';
  }else{
   const signup=await req('/api/auth/invite-signup',{name:'Rahab',token:invitation.url.split('/').at(-1)});expect(signup.status).toBe(201);enrollmentCookie=signup.headers.get('Set-Cookie')!.split(';')[0];const enrollment=await s.sql('SELECT recipient_id FROM enrollment_tokens WHERE token_hash=?',await sha256(enrollmentCookie.split('=')[1])).first<{recipient_id:string}>();userId=enrollment!.recipient_id;
  }
@@ -113,6 +113,16 @@ it.each(['provisioned','invite','activation'])('%s: 実署名Passkeyの登録 �
  expect((await req('/api/auth/passkey/login/verify',{response:assertion},loginCookie)).status).toBe(400);
  expect((await req('/api/auth/logout',{},sessionCookie)).status).toBe(200);
  const after=await worker.fetch(new Request('http://localhost:8787/api/auth/session',{headers:{Cookie:sessionCookie}}),bindings);expect(await after.json()).toEqual({authenticated:false});
+ if(mode==='activation'){
+  const pending=await req('/api/auth/passkey/login/options',{}),challenge=await pending.json() as {challenge:string};
+  const client=Buffer.from(JSON.stringify({type:'webauthn.get',challenge:challenge.challenge,origin:bindings.APP_ORIGIN,crossOrigin:false}));
+  const data=Buffer.concat([hash('localhost'),Buffer.from([0x05,0,0,0,2])]);
+  const stopped={...assertion,response:{...assertion.response,authenticatorData:b64(data),clientDataJSON:b64(client),signature:b64(sign('sha256',Buffer.concat([data,hash(client)]),privateKey))}};
+  expect((await req(`/api/admin/users/${userId}/terminate`,{},activationAdminCookie)).status).toBe(200);
+  expect((await req('/api/auth/passkey/login/verify',{response:stopped},pending.headers.get('Set-Cookie')!.split(';')[0])).status).toBe(400);
+  const credentials=await s.sql('SELECT revoked_at FROM webauthn_credentials WHERE recipient_id=?',userId).all();expect(credentials.results).toHaveLength(2);expect(credentials.results.every(c=>c.revoked_at!==null)).toBe(true);
+ }
+
 });
 
 it('同じactivationを2ブラウザーで同時に実署名登録しても1ユーザー・1credentialだけ確定する',async()=>{

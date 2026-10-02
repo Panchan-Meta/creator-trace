@@ -1,0 +1,20 @@
+import {env,applyD1Migrations} from 'cloudflare:test';
+import {it,expect} from 'vitest';
+import {id,now} from '../src/domain';
+it('0021の適用では既存利用者・Passkey・OWNER・Version・Proofを変更せず、初期値だけ追加する',async()=>{
+ const migrations=(env as unknown as {TEST_MIGRATIONS:Parameters<typeof applyD1Migrations>[1]}).TEST_MIGRATIONS;
+ await applyD1Migrations(env.DB,migrations.filter(m=>m.name<'0021_user_termination.sql'));
+ const user=id(),project=id(),asset=id(),version=id(),time=now(),sql=(q:string,...args:(string|number)[])=>env.DB.prepare(q).bind(...args);
+ await sql('INSERT INTO users(id,display_name,email,created_at) VALUES(?,?,?,?)',user,'Existing','existing@example.com',time).run();await sql('INSERT INTO site_admins VALUES(?,?)',user,time).run();
+ await sql('INSERT INTO webauthn_credentials(id,recipient_id,public_key,counter,transports_json,created_at,name) VALUES(?,?,?,?,?,?,?)','old-credential',user,'old-public-key',5,'[]',time,'Old Passkey').run();
+ await sql('INSERT INTO projects(id,name,owner_id,created_at) VALUES(?,?,?,?)',project,'Existing project',user,time).run();
+ await sql('INSERT INTO assets(id,project_id,filename,mime_type,size,created_at,created_by) VALUES(?,?,?,?,?,?,?)',asset,project,'old.txt','text/plain',3,time,user).run();
+ await sql('INSERT INTO asset_versions(id,asset_id,version,sha256,status,created_by,filename,mime_type,size,created_at) VALUES(?,?,1,?,?,?,?,?,?,?)',version,asset,'b'.repeat(64),'SUBMITTED',user,'old.txt','text/plain',3,time).run();
+ await sql('INSERT INTO proofs(id,asset_version_id,sha256,ots_proof,created_at,timestamp_created_at) VALUES(?,?,?,?,?,?)',id(),version,'b'.repeat(64),(env as unknown as {TEST_OTS:string}).TEST_OTS,time,time).run();
+ const tables=['users','site_admins','webauthn_credentials','sessions','projects','project_members','project_member_history','assets','asset_versions','asset_version_states','approvals','deliveries','delivery_history','proofs','audit_events','account_activations'];
+ const columns=await Promise.all(tables.map(async table=>(await env.DB.prepare(`PRAGMA table_info(${table})`).all<{name:string}>()).results.map(c=>c.name)));
+ const snapshot=async()=>Promise.all(tables.map(async(table,i)=>(await env.DB.prepare(`SELECT ${columns[i].join(',')} FROM ${table} ORDER BY 1`).all()).results));
+ const before=await snapshot();await applyD1Migrations(env.DB,migrations);expect(await snapshot()).toEqual(before);
+ expect(await sql('SELECT status,terminated_at,terminated_by_admin_id,termination_reason FROM users WHERE id=?',user).first()).toEqual({status:'ACTIVE',terminated_at:null,terminated_by_admin_id:null,termination_reason:null});
+ expect(await sql('SELECT revoked_at,revoked_by_admin_id FROM webauthn_credentials WHERE recipient_id=?',user).first()).toEqual({revoked_at:null,revoked_by_admin_id:null});
+});

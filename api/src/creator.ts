@@ -1,6 +1,7 @@
 import {proofDetails,isPublicProof} from './proof-view';
 import { z } from 'zod';
 import { currentUser, cookie } from './auth';
+import {requireActiveUser} from './user-status';
 import { Store, type Bindings } from './store';
 import { HttpError, id, now, sha256, randomToken } from './domain';
 import {access,audit,sourceURL} from './operations';
@@ -28,10 +29,12 @@ export async function creatorRoute(request:Request,env:Bindings,apiUser?:string)
   if(!env.OPERATOR_TOKEN||!token||await sha256(token)!==await sha256(`Bearer ${env.OPERATOR_TOKEN}`))throw new HttpError(403,'初期設定の権限がありません');
   const {user_id}=z.object({user_id:z.string().uuid()}).strict().parse(await request.json());
   if(!await s.sql('SELECT id FROM users WHERE id=?',user_id).first())throw new HttpError(404,'ユーザーが見つかりません');
+  await requireActiveUser(s,user_id);
   const secret=randomToken();await s.sql('INSERT INTO sessions VALUES(?,?,?)',await sha256(secret),user_id,new Date(Date.now()+3600000).toISOString()).run();
   return Response.json({ok:true},{headers:{'Set-Cookie':cookie(env,'punka_session',secret,3600)}});
  }
  const user=apiUser??await currentUser(request,s);
+ if(apiUser)await requireActiveUser(s,user);
  async function project(projectId:string) {
   await access(s,user,projectId,method==='POST'?'manage':'read');
   const item=await s.sql('SELECT * FROM projects WHERE id=?',projectId).first();

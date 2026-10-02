@@ -1,5 +1,6 @@
 import {z} from 'zod';
 import {requireAdmin} from './admin';
+import {terminateUser} from './user-termination';
 import {HttpError,id,now,randomToken,sha256} from './domain';
 import {Store,type Bindings} from './store';
 export type Activation={id:string;email:string;status:string;expires_at:string};
@@ -25,9 +26,11 @@ export async function accountActivationsRoute(request:Request,env:Bindings):Prom
  }
  if(!/^\/api\/admin\/(users|account-activations)(?:\/|$)/.test(path))return null;
  const admin=await requireAdmin(request,s,'利用者管理の権限がありません');
+ const termination=path.match(/^\/api\/admin\/users\/([^/]+)\/terminate$/);
+ if(termination&&request.method==='POST')return terminateUser(request,s,admin,termination[1]);
  await expireAccountActivations(env);
  if(path==='/api/admin/users'&&request.method==='GET'){
-  const users=(await s.sql("SELECT u.id,u.display_name,u.email,u.created_at,CASE WHEN EXISTS(SELECT 1 FROM webauthn_credentials c WHERE c.recipient_id=u.id) THEN 'ACTIVE' ELSE 'UNREGISTERED' END AS status,CASE WHEN EXISTS(SELECT 1 FROM site_admins a WHERE a.user_id=u.id) THEN 'ADMIN' ELSE 'USER' END AS system_role FROM users u ORDER BY u.created_at DESC,u.id").all()).results;
+  const users=(await s.sql("SELECT u.id,u.display_name,u.email,u.created_at,u.status,u.terminated_at,u.terminated_by_admin_id,u.termination_reason,CASE WHEN EXISTS(SELECT 1 FROM webauthn_credentials c WHERE c.recipient_id=u.id AND c.revoked_at IS NULL) THEN 'REGISTERED' ELSE 'UNREGISTERED' END AS passkey_status,CASE WHEN EXISTS(SELECT 1 FROM site_admins a WHERE a.user_id=u.id) THEN 'ADMIN' ELSE 'USER' END AS system_role FROM users u ORDER BY u.created_at DESC,u.id").all()).results;
   const activations=(await s.sql('SELECT id,email,status,expires_at,activated_at,user_id,created_by_admin_id,created_at,revoked_at FROM account_activations ORDER BY created_at DESC,id').all()).results;
   return Response.json({users,activations});
  }

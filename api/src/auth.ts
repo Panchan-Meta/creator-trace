@@ -2,14 +2,16 @@ import { generateRegistrationOptions, generateAuthenticationOptions, verifyRegis
 import { z } from 'zod';
 import {displayName} from './display-name';
 import {activationToken,pendingActivation} from './account-activations';
+import {requireActiveUser} from './user-status';
 import { HttpError, id, now, randomToken, sha256 } from './domain';
 import { Store, type Bindings } from './store';
 export function cookieValue(request:Request,name:string) { return request.headers.get('Cookie')?.split(';').map(v=>v.trim()).find(v=>v.startsWith(`${name}=`))?.slice(name.length+1); }
 export function cookie(env:Bindings,name:string,value:string,seconds:number) { return `${name}=${value}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${seconds}${env.APP_ORIGIN.startsWith('https://')?'; Secure':''}`; }
 export async function currentUser(request:Request,service:Store) {
  const token=cookieValue(request,'punka_session'); if(!token) throw new HttpError(401,'Passkeyでログインしてください');
- const session=await service.sql('SELECT recipient_id FROM sessions WHERE token_hash=? AND expires_at>?',await sha256(token),now()).first<{recipient_id:string}>();
- if(!session) throw new HttpError(401,'ログイン期限が切れています'); return session.recipient_id;
+ const session=await service.sql('SELECT s.recipient_id,u.status FROM sessions s JOIN users u ON u.id=s.recipient_id WHERE s.token_hash=? AND s.expires_at>?',await sha256(token),now()).first<{recipient_id:string;status:string}>();
+ if(!session) throw new HttpError(401,'ログイン期限が切れています');
+ if(session.status!=='ACTIVE')throw new HttpError(403,'このアカウントは利用停止されています');return session.recipient_id;
 }
 // Enrollment cookie binds registration to its original invitation; recheck after device interaction.
 async function validateInviteEnrollment(s:Store,hash:string){
@@ -37,12 +39,12 @@ async function authRequest(request:Request,env:Bindings,path:string):Promise<Res
  if(path==='/api/auth/session' && request.method==='GET') { try {const user=await currentUser(request,s),profile=await s.sql('SELECT display_name FROM users WHERE id=?',user).first<{display_name:string|null}>();const memberships=(await s.sql("SELECT m.project_id,p.name AS project_name,m.role FROM project_members m JOIN projects p ON p.id=m.project_id WHERE m.user_id=? AND m.status='ACTIVE' AND p.archived_at IS NULL ORDER BY p.name,p.id",user).all()).results;return Response.json({authenticated:true,recipient_id:user,display_name:profile?.display_name??'',memberships,is_admin:!!await s.sql('SELECT user_id FROM site_admins WHERE user_id=?',user).first()});} catch {return Response.json({authenticated:false});} }
  if(path==='/api/auth/passkeys' && request.method==='GET') {
   const recipient=await currentUser(request,s);
-  const passkeys=await s.sql('SELECT id,name,created_at FROM webauthn_credentials WHERE recipient_id=? ORDER BY created_at',recipient).all<{created_at:string}>();
+  const passkeys=await s.sql('SELECT id,name,created_at FROM webauthn_credentials WHERE recipient_id=? AND revoked_at IS NULL ORDER BY created_at',recipient).all<{created_at:string}>();
   return Response.json({passkeys:passkeys.results});
  }
  if(request.method!=='POST') throw new HttpError(405,'Method not allowed');
  const removal=path.match(/^\/api\/auth\/passkeys\/([^/]+)\/remove$/);
- if(removal){const user=await currentUser(request,s);const credential=decodeURIComponent(removal[1]);const count=await s.sql('SELECT count(*) AS n FROM webauthn_credentials WHERE recipient_id=?',user).first<{n:number}>();if(count!.n<=1)throw new HttpError(409,'最後のPasskeyは削除できません');await env.DB.batch([s.sql('DELETE FROM webauthn_credentials WHERE id=? AND recipient_id=?',credential,user),s.sql('INSERT INTO audit_events(actor_user_id,event_type,target_type,target_id,created_at) VALUES(?,?,?,?,?)',user,'PASSKEY_REMOVED','passkey',credential,now())]);return Response.json({ok:true});}
+ if(removal){const user=await currentUser(request,s);const credential=decodeURIComponent(removal[1]);const count=await s.sql('SELECT count(*) AS n FROM webauthn_credentials WHERE recipient_id=? AND revoked_at IS NULL',user).first<{n:number}>();if(count!.n<=1)throw new HttpError(409,'最後のPasskeyは削除できません');await env.DB.batch([s.sql('DELETE FROM webauthn_credentials WHERE id=? AND recipient_id=? AND revoked_at IS NULL',credential,user),s.sql('INSERT INTO audit_events(actor_user_id,event_type,target_type,target_id,created_at) VALUES(?,?,?,?,?)',user,'PASSKEY_REMOVED','passkey',credential,now())]);return Response.json({ok:true});}
  if(path==='/api/auth/logout') {
   const token=cookieValue(request,'punka_session'); if(token) await s.sql('DELETE FROM sessions WHERE token_hash=?',await sha256(token)).run();
   return Response.json({ok:true},{headers:{'Set-Cookie':cookie(env,'punka_session','',0)}});
@@ -78,7 +80,8 @@ async function authRequest(request:Request,env:Bindings,path:string):Promise<Res
    }
   }
   if(enrollmentHash)await validateInviteEnrollment(s,enrollmentHash);
-  const options=registration?await generateRegistrationOptions({rpName:'Creator Trace',rpID:env.RP_ID,userName:`Creator Trace ${recipientId!.slice(0,8)}`,userID:Uint8Array.from(new TextEncoder().encode(recipientId!)),attestationType:'none',timeout:300000,authenticatorSelection:{residentKey:'required',userVerification:'required'},excludeCredentials:(await s.sql('SELECT id,transports_json FROM webauthn_credentials WHERE recipient_id=?',recipientId!).all<{id:string;transports_json:string}>()).results.map(c=>({id:c.id,transports:JSON.parse(c.transports_json) as AuthenticatorTransport[]}))}):{...await generateAuthenticationOptions({rpID:env.RP_ID,userVerification:'required',timeout:300000}),hints:['hybrid']};
+  if(registration)await requireActiveUser(s,recipientId!);
+  const options=registration?await generateRegistrationOptions({rpName:'Creator Trace',rpID:env.RP_ID,userName:`Creator Trace ${recipientId!.slice(0,8)}`,userID:Uint8Array.from(new TextEncoder().encode(recipientId!)),attestationType:'none',timeout:300000,authenticatorSelection:{residentKey:'required',userVerification:'required'},excludeCredentials:(await s.sql('SELECT id,transports_json FROM webauthn_credentials WHERE recipient_id=? AND revoked_at IS NULL',recipientId!).all<{id:string;transports_json:string}>()).results.map(c=>({id:c.id,transports:JSON.parse(c.transports_json) as AuthenticatorTransport[]}))}):{...await generateAuthenticationOptions({rpID:env.RP_ID,userVerification:'required',timeout:300000}),hints:['hybrid']};
   // Advisory hints allow phone QR registration without restricting attachment to this PC.
   if(registration)options.hints=['hybrid','client-device','security-key'];
   const challengeId=randomToken();
@@ -117,19 +120,20 @@ async function authRequest(request:Request,env:Bindings,path:string):Promise<Res
     s.sql('INSERT INTO audit_events(actor_user_id,event_type,target_type,target_id,created_at) VALUES(?,?,?,?,?)',recipientId,'PASSKEY_ADDED','passkey',credential.id,now()),s.audit('recipient','PASSKEY_REGISTERED','recipient',recipientId)
    ]);
   } else {
-   const credential=await s.sql('SELECT * FROM webauthn_credentials WHERE id=?',response.id).first<{id:string;recipient_id:string;public_key:string;counter:number;transports_json:string}>();
+   const credential=await s.sql("SELECT c.* FROM webauthn_credentials c JOIN users u ON u.id=c.recipient_id WHERE c.id=? AND c.revoked_at IS NULL AND u.status='ACTIVE'",response.id).first<{id:string;recipient_id:string;public_key:string;counter:number;transports_json:string}>();
    if(!credential) throw new Error('invalid');
    const result=await verifyAuthenticationResponse({response:response as unknown as AuthenticationResponseJSON,expectedChallenge:challenge.challenge,expectedOrigin:env.APP_ORIGIN,expectedRPID:env.RP_ID,requireUserVerification:true,credential:{id:credential.id,publicKey:Uint8Array.from(atob(credential.public_key),c=>c.charCodeAt(0)),counter:credential.counter,transports:JSON.parse(credential.transports_json) as AuthenticatorTransport[]}});
    if(!result.verified) throw new Error('invalid');
    recipientId=credential.recipient_id;
-   const changed=await s.sql('UPDATE webauthn_credentials SET counter=? WHERE id=? AND counter=? RETURNING id',result.authenticationInfo.newCounter,credential.id,credential.counter).first();
+   const changed=await s.sql("UPDATE webauthn_credentials SET counter=? WHERE id=? AND counter=? AND revoked_at IS NULL AND EXISTS(SELECT 1 FROM users WHERE id=recipient_id AND status='ACTIVE') RETURNING id",result.authenticationInfo.newCounter,credential.id,credential.counter).first();
    if(!changed) throw new Error('concurrent assertion');
   }
  } catch {
   throw new HttpError(400,'Passkeyの確認に失敗しました。もう一度お試しください');
  }
  const token=randomToken();
- await env.DB.batch([s.sql('INSERT INTO sessions VALUES(?,?,?)',await sha256(token),recipientId,new Date(Date.now()+86400000).toISOString()),s.audit('recipient','LOGIN_SUCCEEDED','recipient',recipientId)]);
+ await requireActiveUser(s,recipientId);
+ try{await env.DB.batch([s.sql('INSERT INTO sessions VALUES(?,?,?)',await sha256(token),recipientId,new Date(Date.now()+86400000).toISOString()),s.audit('recipient','LOGIN_SUCCEEDED','recipient',recipientId)]);}catch(error){await requireActiveUser(s,recipientId);throw error;}
  const headers=new Headers();headers.append('Set-Cookie',cookie(env,'punka_session',token,86400));headers.append('Set-Cookie',cookie(env,'punka_challenge','',0));
  if(activationContext)headers.append('Set-Cookie',cookie(env,'ct_activation','',0));
  return Response.json({ok:true},{headers});

@@ -5,7 +5,7 @@ import {creatorRoute} from './creator';
 export async function publicAPI(request:Request,env:Bindings){
  if(request.method!=='GET')throw new HttpError(405,'Read-only API');
  const raw=request.headers.get('Authorization')?.match(/^Bearer (ct_[A-Za-z0-9_-]+)$/)?.[1];if(!raw)throw new HttpError(401,'APIキーが必要です');const s=new Store(env);
- const key=await s.sql('SELECT * FROM api_keys WHERE key_hash=? AND revoked_at IS NULL',await sha256(raw)).first<{key_id:string;user_id:string;project_id:string|null;scopes:string}>();if(!key)throw new HttpError(401,'APIキーが無効です');
+ const key=await s.sql("SELECT k.* FROM api_keys k JOIN users u ON u.id=k.user_id WHERE k.key_hash=? AND k.revoked_at IS NULL AND u.status='ACTIVE'",await sha256(raw)).first<{key_id:string;user_id:string;project_id:string|null;scopes:string}>();if(!key)throw new HttpError(401,'APIキーが無効です');
  const url=new URL(request.url),path=url.pathname.replace('/api/v1/','/api/'),m=path.match(/^\/api\/(projects|assets|proofs|verify)(?:\/([^/]+))?(?:\/(versions))?$/);if(!m||(!m[2]&&m[1]!=='projects')||(m[3]&&m[1]!=='assets'))throw new HttpError(404,'APIが見つかりません');
  if(!(JSON.parse(key.scopes) as string[]).includes(`${m[1]}:read`))throw new HttpError(403,'scopeが不足しています');
  const count=await s.sql('INSERT INTO rate_limits(key,count,reset_at) VALUES(?,1,?) ON CONFLICT(key) DO UPDATE SET count=CASE WHEN reset_at=excluded.reset_at THEN count+1 ELSE 1 END,reset_at=excluded.reset_at RETURNING count',`key:${key.key_id}`,Math.floor(Date.now()/60000)).first<{count:number}>();if(count!.count>60)throw new HttpError(429,'API rate limit');
