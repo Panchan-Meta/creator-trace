@@ -1,0 +1,38 @@
+{
+  "environment": "local isolated D1, live external OTS calendar",
+  "proofId": "b0fd67c7-f934-4d98-80a5-eb69c3aa9ca7",
+  "sha256": "b7d1ac9356fbac0369dd08100edd8999d5fa666bc39c58da7042f233203362e8",
+  "registered": "2026-10-02T03:43:54.031Z",
+  "timestamp_created_at": "2026-10-02T03:43:58.856Z",
+  "bitcoin_confirmed_at": null,
+  "proof_status": "WAITING_BITCOIN",
+  "retry_count": 2,
+  "verification": {
+    "state": "WAITING_BITCOIN",
+    "has_ots": true,
+    "receipt_valid": true,
+    "bitcoin_attestation_count": 0,
+    "anchors": [],
+    "api_configured": false,
+    "last_checked_at": "2026-10-02T03:44:59.886Z",
+    "error_code": null,
+    "failure_stage": null,
+    "last_attempt": {
+      "state": "WAITING_BITCOIN",
+      "provider": null,
+      "block_height": null,
+      "block_hash": null,
+      "block_time": null,
+      "confirmations": null,
+      "error_code": null,
+      "checked_at": "2026-10-02T03:44:59.886Z",
+      "failure_stage": null,
+      "error_type": null,
+      "http_status": null
+    },
+    "last_success": null
+  },
+  "version_unchanged": true,
+  "file_match": true,
+  "modified_file_match": false
+}

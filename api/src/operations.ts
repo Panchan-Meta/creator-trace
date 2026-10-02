@@ -1,0 +1,81 @@
+import {z} from 'zod';
+import {Store,type Bindings} from './store';
+import {currentUser} from './auth';
+import {HttpError,id,now,randomToken,sha256} from './domain';
+import {processProof} from './timestamps';
+export type Role='OWNER'|'MANAGER'|'CREATOR'|'REVIEWER'|'VIEWER';
+export const permissions:Record<string,Role[]>={read:['OWNER','MANAGER','CREATOR','REVIEWER','VIEWER'],manage:['OWNER','MANAGER'],write:['OWNER','MANAGER','CREATOR'],comment:['REVIEWER'],review:['OWNER','MANAGER','REVIEWER'],finalize:['OWNER'],deliver:['OWNER','MANAGER']};
+export async function access(s:Store,user:string,projectId:string,action='read'){
+ const row=await s.sql("SELECT role,status FROM project_members WHERE project_id=? AND user_id=?",projectId,user).first<{role:Role;status:string}>();
+ if(!row)throw new HttpError(404,'案件が見つかりません');if(row.status!=='ACTIVE')throw new HttpError(403,'この案件のメンバーではありません');if(!permissions[action]?.includes(row.role))throw new HttpError(403,'操作権限がありません');if(action!=='read'&&await s.sql('SELECT id FROM projects WHERE id=? AND archived_at IS NOT NULL',projectId).first())throw new HttpError(409,'案件はアーカイブ済みです');return row.role;
+}
+export function audit(s:Store,project:string|null,user:string,event:string,type:string,target:string,metadata:object={}){return s.sql('INSERT INTO audit_events(project_id,actor_user_id,event_type,target_type,target_id,metadata_json,created_at) VALUES(?,?,?,?,?,?,?)',project,user,event,type,target,JSON.stringify(metadata),now());}
+export const sourceURL=z.string().max(2048).refine(value=>{try{const u=new URL(value);return u.protocol==='https:'&&!u.username&&!u.password&&!u.search&&!u.hash;}catch{return false;}},'資格情報を含まないHTTPS URLを入力してください');
+export async function operationsRoute(request:Request,env:Bindings):Promise<Response|null>{
+ const url=new URL(request.url),path=url.pathname,s=new Store(env);let m:RegExpMatchArray|null;
+ if(path==='/api/business/inquiries'&&request.method==='POST'){
+  const d=z.object({name:z.string().trim().min(1).max(200),company:z.string().max(200),email:z.email().max(254),team_size:z.string().max(100),current_tools:z.string().max(1000),problem:z.string().max(4000),message:z.string().max(4000),website:z.string().max(200).default('')}).strict().parse(await request.json());
+  if(d.website)throw new HttpError(400,'入力を確認してください');const inquiry=id();await s.sql('INSERT INTO business_inquiries(id,name,company,email,team_size,current_tools,problem,message,created_at) VALUES(?,?,?,?,?,?,?,?,?)',inquiry,d.name,d.company,d.email,d.team_size,d.current_tools,d.problem,d.message,now()).run();return Response.json({id:inquiry,ok:true},{status:201});
+ }
+ if(!/^\/api\/(asset-versions|deliveries|project-invites|api-keys)\b/.test(path)&&!/^\/api\/(projects\/[^/]+\/(members(?:\/[^/]+\/(?:remove|approver))?|invites|edit|archive|audit)|assets\/[^/]+\/(?:archive|review-comments)|proofs\/[^/]+\/(retry|bitcoin-recheck|ots))$/.test(path))return null;
+ const user=await currentUser(request,s);
+ async function version(versionId:string,action:string){const v=await s.sql('SELECT v.*,a.project_id,st.status AS current_status FROM asset_versions v JOIN assets a ON a.id=v.asset_id JOIN asset_version_states st ON st.asset_version_id=v.id WHERE v.id=?',versionId).first<{id:string;project_id:string;created_by:string;current_status:string}>();if(!v)throw new HttpError(404,'版が見つかりません');const role=await access(s,user,v.project_id,action);if(action==='write'&&role==='CREATOR'&&v.created_by!==user)throw new HttpError(403,'自分の制作物のみ操作できます');return v;}
+ if((m=path.match(/^\/api\/asset-versions\/([^/]+)\/(submit|approve|reject|finalize|history|deliveries)$/))){
+  const action=m[2],v=await version(m[1],action==='submit'?'write':['approve','reject'].includes(action)?'review':action==='finalize'?'finalize':action==='deliveries'&&request.method==='POST'?'deliver':'read');
+  if(action==='history'&&request.method==='GET')return Response.json({history:(await s.sql('SELECT * FROM asset_version_state_history WHERE asset_version_id=? ORDER BY id',v.id).all()).results,approvals:(await s.sql('SELECT id,asset_version_id,approver_id AS approver_user_id,status AS decision,comment,created_at,approver_role FROM approvals WHERE asset_version_id=? ORDER BY created_at',v.id).all()).results});
+  if(action==='deliveries'){
+   if(request.method==='GET')return Response.json((await s.sql('SELECT * FROM deliveries WHERE asset_version_id=? ORDER BY delivered_at',v.id).all()).results);
+   if(v.current_status!=='FINAL')throw new HttpError(409,'FINAL版のみ納品できます');
+   const parsed=z.object({recipient_user_id:z.string({error:'受領者を選択してください'}).min(1,{error:'受領者を選択してください'}).uuid({error:'受領者の指定が不正です。案件メンバーから選択してください'}),comment:z.string().max(4000,{error:'納品コメントは4000文字以内で入力してください'}).default('')}).strict().safeParse(await request.json());
+   if(!parsed.success)throw new HttpError(400,parsed.error.issues[0].message);const d=parsed.data;
+   const recipient=await s.sql("SELECT user_id FROM project_members WHERE project_id=? AND user_id=? AND status='ACTIVE'",v.project_id,d.recipient_user_id).first();
+   if(!recipient)throw new HttpError(403,'選択したユーザーはこの案件のメンバーではありません');const delivery=id(),time=now();await env.DB.batch([s.sql('INSERT INTO deliveries(id,asset_version_id,delivered_by,delivered_at,recipient_user_id,comment) VALUES(?,?,?,?,?,?)',delivery,v.id,user,time,d.recipient_user_id,d.comment)]);return Response.json({id:delivery},{status:201});
+  }
+  if(request.method!=='POST')throw new HttpError(405,'Method not allowed');
+  const parsed=z.object({reason:z.string().trim().max(4000).optional(),comment:z.string().trim().max(4000).optional()}).strict().safeParse(await request.json());if(!parsed.success)throw new HttpError(400,'コメントは4000文字以内で入力してください');if(parsed.data.reason!==undefined&&parsed.data.comment!==undefined&&parsed.data.reason!==parsed.data.comment)throw new HttpError(400,'コメントの指定が一致しません');const d={reason:parsed.data.comment??parsed.data.reason??''};if(action==='reject'&&!d.reason)throw new HttpError(400,'差戻しコメントを入力してください');const targets:Record<string,[string,string]>={submit:['DRAFT','SUBMITTED'],approve:['SUBMITTED','APPROVED'],reject:['SUBMITTED','REJECTED'],finalize:['APPROVED','FINAL']};const transition=targets[action];
+  if(!transition||v.current_status!==transition[0])throw new HttpError(409,'状態遷移が不正です');
+  const changed=await s.sql('UPDATE asset_version_states SET status=?,actor_user_id=?,reason=?,updated_at=? WHERE asset_version_id=? AND status=? RETURNING status',transition[1],user,d.reason,now(),v.id,transition[0]).first();if(!changed)throw new HttpError(409,'状態が変更されました');
+  if(action==='finalize'){const proof=await s.sql('SELECT id FROM proofs WHERE asset_version_id=?',v.id).first<{id:string}>();if(proof)await processProof(env,proof.id,user);}
+  return Response.json(changed);
+ }
+ if((m=path.match(/^\/api\/deliveries\/([^/]+)\/(receive|reject)$/))&&request.method==='POST'){
+  const d=await s.sql('SELECT d.*,a.project_id FROM deliveries d JOIN asset_versions v ON v.id=d.asset_version_id JOIN assets a ON a.id=v.asset_id WHERE d.id=?',m[1]).first<{recipient_user_id:string;project_id:string}>();if(!d)throw new HttpError(404,'納品が見つかりません');if(await access(s,user,d.project_id)==='VIEWER')throw new HttpError(403,'VIEWERは閲覧のみ可能です');if(d.recipient_user_id!==user)throw new HttpError(403,'受領者のみ操作できます');const body=z.object({comment:z.string().max(4000).default('')}).strict().parse(await request.json()),status=m[2]==='receive'?'RECEIVED':'REJECTED',time=now();
+  const updated=await s.sql("UPDATE deliveries SET receipt_status=?,received_at=?,comment=? WHERE id=? AND receipt_status='DELIVERED' RETURNING id",status,status==='RECEIVED'?time:null,body.comment,m[1]).first();if(!updated)throw new HttpError(409,'受領操作済みです');return Response.json({ok:true});
+ }
+ if((m=path.match(/^\/api\/proofs\/([^/]+)\/(retry|bitcoin-recheck|ots)$/))){const p=await s.sql('SELECT pr.*,a.project_id FROM proofs pr JOIN asset_versions v ON v.id=pr.asset_version_id JOIN assets a ON a.id=v.asset_id WHERE pr.id=?',m[1]).first<{project_id:string;ots_proof:string|null}>();if(!p)throw new HttpError(404,'証跡が見つかりません');await access(s,user,p.project_id,m[2]!=='ots'?'deliver':'read');if(['retry','bitcoin-recheck'].includes(m[2])&&request.method==='POST'){if(m[2]==='bitcoin-recheck'&&!p.ots_proof)throw new HttpError(409,'外部タイムスタンプの証跡を先に作成してください');const outcome=await processProof(env,m[1],user,m[2]==='bitcoin-recheck');return Response.json({ok:true,...(m[2]==='bitcoin-recheck'?outcome:{})});}if(m[2]==='ots'&&request.method==='GET'){if(!p.ots_proof)throw new HttpError(409,'OTSはまだ作成されていません');return new Response(Buffer.from(p.ots_proof,'base64'),{headers:{'Content-Type':'application/octet-stream','Content-Disposition':`attachment; filename="${m[1].replace(/[^a-zA-Z0-9-]/g,'')}.ots"`}});}}
+ if((m=path.match(/^\/api\/assets\/([^/]+)\/review-comments$/))){
+  const asset=await s.sql('SELECT id,project_id,archived_at FROM assets WHERE id=?',m[1]).first<{id:string;project_id:string;archived_at:string|null}>();if(!asset)throw new HttpError(404,'制作物が見つかりません');await access(s,user,asset.project_id,request.method==='POST'?'comment':'read');
+  if(request.method==='GET')return Response.json((await s.sql('SELECT c.*,v.version,CASE WHEN m.status=\'ACTIVE\' THEN 0 ELSE 1 END AS reviewer_removed FROM review_comments c JOIN asset_versions v ON v.id=c.version_id LEFT JOIN project_members m ON m.project_id=? AND m.user_id=c.reviewer_id WHERE c.artifact_id=? ORDER BY c.created_at ASC,c.rowid ASC',asset.project_id,asset.id).all()).results);
+  if(request.method!=='POST')throw new HttpError(405,'Method not allowed');const parsed=z.object({version_id:z.string().uuid(),comment:z.string().trim().min(1,'コメントを入力してください').max(4000,'コメントは4000文字以内で入力してください')}).strict().safeParse(await request.json());if(!parsed.success)throw new HttpError(400,parsed.error.issues[0].message);const d=parsed.data;if(asset.archived_at)throw new HttpError(409,'制作物はアーカイブ済みです');
+  if(!await s.sql('SELECT id FROM asset_versions WHERE id=? AND asset_id=?',d.version_id,asset.id).first())throw new HttpError(400,'選択したVersionはこの制作物に属していません');const profile=await s.sql('SELECT display_name FROM users WHERE id=?',user).first<{display_name:string|null}>(),commentId=id(),time=now();
+  await s.sql('INSERT INTO review_comments(id,artifact_id,version_id,reviewer_id,reviewer_name,comment,created_at) VALUES(?,?,?,?,?,?,?)',commentId,asset.id,d.version_id,user,profile?.display_name||'表示名未設定',d.comment,time).run();return Response.json({id:commentId,artifact_id:asset.id,version_id:d.version_id,reviewer_id:user,reviewer_name:profile?.display_name||'表示名未設定',comment:d.comment,created_at:time},{status:201});
+ }
+ if((m=path.match(/^\/api\/projects\/([^/]+)\/members\/([^/]+)\/approver$/))){
+  if(request.method!=='POST')throw new HttpError(405,'Method not allowed');const project=m[1];if(await access(s,user,project)!=='OWNER')throw new HttpError(403,'OWNERのみ承認担当を設定できます');await access(s,user,project,'manage');const d=z.object({enabled:z.boolean()}).strict().parse(await request.json());
+  throw new HttpError(410,'承認担当の個別設定は終了しました。案件Roleで権限を判定します');
+ }
+ if((m=path.match(/^\/api\/projects\/([^/]+)\/members\/([^/]+)\/remove$/))){
+  if(request.method!=='POST')throw new HttpError(405,'Method not allowed');const project=m[1],memberId=m[2];if(await access(s,user,project)!=='OWNER')throw new HttpError(403,'OWNERのみメンバーを外せます');await access(s,user,project,'manage');z.object({}).strict().parse(await request.json());
+  const target=await s.sql('SELECT user_id,role,status FROM project_members WHERE project_id=? AND id=?',project,memberId).first<{user_id:string;role:string;status:string}>();if(!target)throw new HttpError(404,'案件メンバーが見つかりません');if(target.role==='OWNER')throw new HttpError(409,'OWNERはこの操作では外せません');if(target.status!=='ACTIVE')throw new HttpError(409,'このメンバーはすでに取り消されています');
+  const removed=await s.sql("UPDATE project_members SET status='REMOVED',removed_at=?,removed_by=? WHERE project_id=? AND id=? AND status='ACTIVE' AND role!='OWNER' AND EXISTS(SELECT 1 FROM project_members owner WHERE owner.project_id=? AND owner.user_id=? AND owner.role='OWNER' AND owner.status='ACTIVE') RETURNING id,user_id,role,status,removed_at,removed_by",now(),user,project,memberId,project,user).first();if(!removed)throw new HttpError(409,'メンバーの状態が変更されています');return Response.json(removed);
+ }
+ if((m=path.match(/^\/api\/projects\/([^/]+)\/(members|invites|edit|archive|audit)$/))){const project=m[1],action=m[2];await access(s,user,project,['members','audit'].includes(action)?'read':'manage');
+  if(action==='members'&&request.method==='GET'){
+   const members=(await s.sql("SELECT m.id,m.user_id,m.role AS base_role,m.role,m.status,m.created_at AS joined_at,m.removed_at,m.removed_by,r.display_name AS removed_by_name,COALESCE(NULLIF(u.display_name,''),(SELECT i.email FROM project_invites i WHERE i.project_id=m.project_id AND i.consumed_by=m.user_id AND i.consumed_at IS NOT NULL ORDER BY i.consumed_at DESC LIMIT 1)) AS display_name FROM project_members m JOIN users u ON u.id=m.user_id LEFT JOIN users r ON r.id=m.removed_by WHERE m.project_id=? ORDER BY m.created_at,m.id",project).all()).results;
+   const history=(await s.sql('SELECT h.*,u.display_name AS removed_by_name FROM project_member_history h LEFT JOIN users u ON u.id=h.removed_by WHERE h.project_id=? ORDER BY h.id',project).all()).results;
+   return Response.json(members.map(member=>({...member,history:history.filter(h=>h.member_id===member.id)})));
+  }
+  if(action==='audit'&&request.method==='GET')return Response.json((await s.sql('SELECT * FROM audit_events WHERE project_id=? ORDER BY id DESC LIMIT 100',project).all()).results);
+  if(request.method!=='POST')throw new HttpError(405,'Method not allowed');
+  if(action==='edit'){const d=z.object({name:z.string().trim().min(1).max(200),client_name:z.string().max(200),description:z.string().max(4000).default('')}).strict().parse(await request.json());await env.DB.batch([s.sql('UPDATE projects SET name=?,client_name=?,description=? WHERE id=?',d.name,d.client_name,d.description,project),audit(s,project,user,'PROJECT_UPDATED','project',project)]);return Response.json({ok:true});}
+  if(action==='archive'){await env.DB.batch([s.sql('UPDATE projects SET archived_at=COALESCE(archived_at,?) WHERE id=?',now(),project),audit(s,project,user,'PROJECT_ARCHIVED','project',project)]);return Response.json({ok:true});}
+
+ }
+ if((m=path.match(/^\/api\/assets\/([^/]+)\/archive$/))&&request.method==='POST'){const a=await s.sql('SELECT project_id FROM assets WHERE id=?',m[1]).first<{project_id:string}>();if(!a)throw new HttpError(404,'制作物が見つかりません');await access(s,user,a.project_id,'manage');await env.DB.batch([s.sql('UPDATE assets SET archived_at=COALESCE(archived_at,?) WHERE id=?',now(),m[1]),audit(s,a.project_id,user,'ASSET_ARCHIVED','asset',m[1])]);return Response.json({ok:true});}
+ if(path==='/api/api-keys'){
+  if(request.method==='GET')return Response.json((await s.sql('SELECT key_id,name,scopes,project_id,created_at,last_used_at,revoked_at FROM api_keys WHERE user_id=?',user).all()).results);
+  const d=z.object({name:z.string().trim().min(1).max(200),project_id:z.string().uuid().nullable().default(null),scopes:z.array(z.enum(['projects:read','assets:read','proofs:read','verify:read'])).min(1).max(4)}).strict().parse(await request.json());if(d.project_id)await access(s,user,d.project_id,'manage');const key_id=id(),key=`ct_${randomToken()}`;await env.DB.batch([s.sql('INSERT INTO api_keys(key_id,key_hash,user_id,project_id,name,scopes,created_at) VALUES(?,?,?,?,?,?,?)',key_id,await sha256(key),user,d.project_id,d.name,JSON.stringify(d.scopes),now()),audit(s,d.project_id,user,'API_KEY_CREATED','api_key',key_id)]);return Response.json({key_id,key},{status:201});
+ }
+ if((m=path.match(/^\/api\/api-keys\/([^/]+)\/revoke$/))&&request.method==='POST'){const key=await s.sql('UPDATE api_keys SET revoked_at=COALESCE(revoked_at,?) WHERE key_id=? AND user_id=? RETURNING project_id',now(),m[1],user).first<{project_id:string|null}>();if(!key)throw new HttpError(404,'APIキーが見つかりません');await audit(s,key.project_id,user,'API_KEY_REVOKED','api_key',m[1]).run();return Response.json({ok:true});}
+ throw new HttpError(404,'ページが見つかりません');
+}

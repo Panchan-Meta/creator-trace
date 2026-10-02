@@ -1,0 +1,12 @@
+const {spawnSync,spawn}=require('node:child_process');
+const fs=require('node:fs'),os=require('node:os'),path=require('node:path');
+const dir=fs.mkdtempSync(path.join(os.tmpdir(),'punka-e2e-'));
+const cli=path.resolve(__dirname,'../node_modules/wrangler/bin/wrangler.js');
+const config=path.resolve(__dirname,'../e2e/wrangler.jsonc');
+const migration=spawnSync(process.execPath,[cli,'d1','migrations','apply','punka-e2e','--local','--config',config,'--persist-to',dir],{stdio:'inherit'});
+if(migration.status!==0)process.exit(migration.status??1);
+const seed=spawnSync(process.execPath,[cli,'d1','execute','punka-e2e','--local','--config',config,'--persist-to',dir,'--command',"INSERT INTO users(id,display_name,created_at) VALUES('11111111-1111-4111-8111-111111111111','Punka',strftime('%Y-%m-%dT%H:%M:%fZ','now')); INSERT INTO site_admins(user_id,created_at) VALUES('11111111-1111-4111-8111-111111111111',strftime('%Y-%m-%dT%H:%M:%fZ','now'))"],{stdio:'inherit'});
+if(seed.status!==0)process.exit(seed.status??1);
+const child=spawn(process.execPath,[cli,'dev','--config',config,'--port','8791','--persist-to',dir],{stdio:'inherit'});
+for(const signal of ['SIGTERM','SIGINT'])process.on(signal,()=>child.kill(signal));
+child.on('exit',code=>process.exit(code??0));

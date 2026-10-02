@@ -1,0 +1,28 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+
+  "name": "creator-trace-api",
+
+  "compatibility_date": "2026-09-29",
+
+  "vars": {
+    "XAI_BASE_URL": "https://api.x.ai/v1",
+    "XAI_MODEL": "grok-4.7"
+  },
+
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "creator-trace-db",
+      "database_id": "c8437401-e69a-4423-9818-29fed9347dd3",
+      "migrations_dir": "migrations"
+    }
+  ],
+
+  "r2_buckets": [
+    {
+      "binding": "PROOFS",
+      "bucket_name": "creator-trace-proofs"
+    }
+  ]
+}

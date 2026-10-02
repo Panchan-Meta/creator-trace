@@ -1,0 +1,21 @@
+node_modules/
+.env
+.env.*
+!.env.example
+.wrangler/
+dist/
+build/
+*.log
+.DS_Store
+api/.dev.vars
+
+# Python virtual environment
+.venv/
+
+# Local secrets
+.dev.vars
+
+# Test artifacts
+test-results/
+playwright-report/
+coverage/

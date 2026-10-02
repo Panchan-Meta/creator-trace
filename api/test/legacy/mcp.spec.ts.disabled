@@ -1,0 +1,100 @@
+import { env, applyD1Migrations } from 'cloudflare:test';
+import { beforeAll, it, expect } from 'vitest';
+import worker from '../src/index';
+import { ProofService, type Bindings } from '../src/service';
+import { bots, allowedTools } from '../src/mcp-policy';
+import { id } from '../src/domain';
+const bindings:Bindings={...env,APP_ORIGIN:'http://localhost:8787',RP_ID:'localhost',OPERATOR_TOKEN:'test-operator',PUNKA_APPROVAL_TOKEN:'test-human'};
+for(const bot of bots)bindings[bot.secret]=`test-${bot.id}`;
+const s=new ProofService(bindings);
+let batch:string;
+const review={result:'concern',risk_level:'medium',recommendation:'escalate_to_punka',summary:'human_decision_required',issues:['consent'],model:'grok',prompt_version:'v1'};
+async function req(path='/mcp/mido',token:string|undefined=bindings.MCP_MIDO_TOKEN,message:unknown={jsonrpc:'2.0',id:1,method:'tools/list'},extra:Record<string,string>={}){
+ return worker.fetch(new Request(`http://localhost:8787${path}`,{method:'POST',headers:{'Content-Type':'application/json',Accept:'application/json, text/event-stream',...(token?{Authorization:`Bearer ${token}`} :{}),...extra},body:JSON.stringify(message)}),bindings);
+}
+const call=(name:string,args:unknown={batch_id:batch})=>({jsonrpc:'2.0',id:1,method:'tools/call',params:{name,arguments:args}});
+beforeAll(async()=>{
+ await applyD1Migrations(env.DB,(env as unknown as {TEST_MIGRATIONS:Parameters<typeof applyD1Migrations>[1]}).TEST_MIGRATIONS);
+ const imported=await s.import({filename:'private-name.csv',csv:'name,email,course,completed_at\n秘密氏名,private@example.com,秘密講座,2026-09-30',issuer:{id:id(),name:'private-issuer'}});batch=imported.id;
+});
+it('no token / invalid token => 401 with challenge; no secrets in audit',async()=>{
+ const missing=await req('/mcp/mido','');expect(missing.status).toBe(401);expect(missing.headers.get('WWW-Authenticate')).toContain('Bearer');
+ expect((await req('/mcp/mido','secret-invalid')).status).toBe(401);
+ const logs=JSON.stringify((await s.sql("SELECT * FROM audit_logs WHERE action='MCP_AUTH_FAILED'" ).all()).results);expect(logs).not.toContain('secret-invalid');
+});
+it('disabled binding / wrong path / role tampering => 403',async()=>{
+ await s.sql('UPDATE bot_bindings SET enabled=0 WHERE internal_agent_id=?','mido_security').run();expect((await req()).status).toBe(403);
+ await s.sql('UPDATE bot_bindings SET enabled=1 WHERE internal_agent_id=?','mido_security').run();
+ expect((await req('/mcp/shiraishi')).status).toBe(403);
+ await s.sql('UPDATE bot_bindings SET role=? WHERE internal_agent_id=?','Compliance','mido_security').run();expect((await req()).status).toBe(403);
+ await s.sql('UPDATE bot_bindings SET role=? WHERE internal_agent_id=?','Security','mido_security').run();
+});
+it('each bot sees exactly its allowed tools and forbidden tools are denied',async()=>{
+ for(const bot of bots){
+  const list=await (await req(`/mcp/${bot.path}`,bindings[bot.secret])).json() as {result:{tools:{name:string}[]}};
+  expect(list.result.tools.map(t=>t.name)).toEqual(allowedTools(bot));
+  for(const name of ['approve_batch','issue_certificate','revoke_certificate','delete_certificate','delete_audit_log']){
+   const response=await (await req(`/mcp/${bot.path}`,bindings[bot.secret],call(name))).json() as {error:{message:string}};expect(response.error.message).toBe('Tool denied');
+  }
+ }
+ expect((await (await req('/mcp/mido',bindings.MCP_MIDO_TOKEN,call('get_security_summary'))).json() as {result:unknown}).result).toBeTruthy();
+ expect((await (await req('/mcp/mido',bindings.MCP_MIDO_TOKEN,call('submit_compliance_review',{batch_id:batch,...review}))).json() as {error:unknown}).error).toBeTruthy();
+});
+it('read tools never expose source fields or PII; review and audit persisted atomically',async()=>{
+ for(const bot of bots){
+  for(const name of allowedTools(bot).filter(n=>!n.startsWith('submit_')&&!['get_certificate_status','get_proof_status','get_certificate_proof_status','get_verify_preview'].includes(n))){
+   const text=await (await req(`/mcp/${bot.path}`,bindings[bot.secret],call(name))).text();
+   for(const pii of ['秘密氏名','private@example.com','秘密講座','private-name.csv','private-issuer','source_filename','registration_url','public_key'])expect(text).not.toContain(pii);
+  }
+  const name=bot.tools.find(t=>t.startsWith('submit_'))!;
+  const saved=await (await req(`/mcp/${bot.path}`,bindings[bot.secret],call(name,{batch_id:batch,...review}))).json() as {result:{isError?:boolean}};expect(saved.result.isError).toBeUndefined();
+ }
+ const rows=(await s.sql('SELECT * FROM bot_reviews WHERE batch_id=?',batch).all()).results;expect(rows).toHaveLength(5);
+ expect((await s.sql('SELECT status FROM workflow_runs WHERE batch_id=?',batch).first())?.status).toBe('COMPLETED');
+ const duplicate=await (await req('/mcp/mido',bindings.MCP_MIDO_TOKEN,call('submit_security_review',{batch_id:batch,...review}))).json() as {result:{isError:boolean}};expect(duplicate.result.isError).toBe(true);
+ const logs=(await s.sql("SELECT action,actor_id,metadata_json FROM audit_logs WHERE action LIKE 'MCP_%' OR action='BOT_REVIEW_SUBMITTED'").all()).results;
+ for(const action of ['MCP_AUTH_SUCCEEDED','MCP_AUTH_FAILED','MCP_TOOL_CALLED','MCP_TOOL_DENIED','BOT_REVIEW_SUBMITTED'])expect(logs.some(l=>l.action===action)).toBe(true);
+ expect(logs.filter(l=>l.action==='BOT_REVIEW_SUBMITTED')).toHaveLength(5);
+ expect(logs.some(l=>l.actor_id==='mido_security')).toBe(true);
+ for(const bot of bots)expect(JSON.stringify(logs)).not.toContain(bindings[bot.secret]);
+});
+it('PII review and role spoofing rejected; bad IDs / JSON / origin / protocol handled',async()=>{
+ for(const args of [{batch_id:batch,...review,summary:'private@example.com'},{batch_id:batch,...review,role:'Compliance'},{batch_id:'bad-id'}]){
+  const data=await (await req('/mcp/mido',bindings.MCP_MIDO_TOKEN,call('submit_security_review',args))).json() as {result:{isError:boolean}};expect(data.result.isError).toBe(true);
+ }
+ expect((await req('/mcp/mido',bindings.MCP_MIDO_TOKEN,call('get_security_summary'),{Origin:'https://evil.example'})).status).toBe(403);
+ expect((await req('/mcp/mido',bindings.MCP_MIDO_TOKEN,call('get_security_summary'),{'MCP-Protocol-Version':'invalid'})).status).toBe(400);
+ expect((await req('/mcp/mido',bindings.MCP_MIDO_TOKEN,{}, {Accept:'application/json'})).status).toBe(406);
+ expect((await (await req('/mcp/mido',bindings.MCP_MIDO_TOKEN,[])).json() as {error:{code:number}}).error.code).toBe(-32600);
+ expect((await req('/mcp/mido',bindings.MCP_MIDO_TOKEN,call('get_security_summary',{batch_id:batch,payload:'a'.repeat(17000)}))).status).toBe(413);
+});
+it('initialize, notification, ping, authenticated GET and public health',async()=>{
+ const initialized=await (await req('/mcp/mido',bindings.MCP_MIDO_TOKEN,{jsonrpc:'2.0',id:1,method:'initialize',params:{protocolVersion:'2025-11-25',capabilities:{},clientInfo:{name:'test',version:'1'}}})).json() as {result:{protocolVersion:string}};expect(initialized.result.protocolVersion).toBe('2025-11-25');
+ expect((await req('/mcp/mido',bindings.MCP_MIDO_TOKEN,{jsonrpc:'2.0',method:'notifications/initialized'})).status).toBe(202);
+ expect((await req('/mcp/mido',bindings.MCP_MIDO_TOKEN,{jsonrpc:'2.0',id:2,method:'ping'})).status).toBe(200);
+ expect((await worker.fetch(new Request('http://localhost:8787/mcp/mido'),bindings)).status).toBe(401);
+ expect((await worker.fetch(new Request('http://localhost:8787/mcp/mido',{headers:{Authorization:`Bearer ${bindings.MCP_MIDO_TOKEN}`}}),bindings)).status).toBe(405);
+ const health=await worker.fetch(new Request('http://localhost:8787/mcp/health'),bindings);expect(await health.json()).toEqual({status:'ok',service:'punka-proof-mcp'});
+ expect((await worker.fetch(new Request('http://localhost:8787/api/health'),bindings)).status).toBe(200);
+});
+it('bots cannot use admin API; operator cannot issue; reused credentials fail closed',async()=>{
+ for(const bot of bots)for(const action of ['approve','issue']){
+  const response=await worker.fetch(new Request(`http://localhost:8787/api/issuance-batches/${batch}/${action}`,{method:'POST',headers:{Authorization:`Bearer ${bindings[bot.secret]}`},body:'{}'}),bindings);expect(response.status).toBe(403);
+ }
+ for(const bot of bots){const response=await worker.fetch(new Request(`http://localhost:8787/api/certificates/${id()}/revoke`,{method:'POST',headers:{Authorization:`Bearer ${bindings[bot.secret]}`},body:'{}'}),bindings);expect(response.status).toBe(403);}
+ const operator=await worker.fetch(new Request(`http://localhost:8787/api/issuance-batches/${batch}/issue`,{method:'POST',headers:{Authorization:'Bearer test-operator'},body:'{}'}),bindings);expect(operator.status).toBe(403);
+ const reused={...bindings,MCP_MIDO_TOKEN:bindings.PUNKA_APPROVAL_TOKEN};
+ const response=await worker.fetch(new Request(`http://localhost:8787/api/issuance-batches/${batch}/issue`,{method:'POST',headers:{Authorization:'Bearer test-human'},body:'{}'}),reused);expect(response.status).toBe(403);
+ expect((await worker.fetch(new Request('http://localhost:8787/mcp/mido',{method:'POST',headers:{Authorization:'Bearer test-human'}}),reused)).status).toBe(401);
+});
+
+it('certificate and proof tools omit PII even when public labels contain PII',async()=>{
+ const b=await s.import({filename:'secret.csv',csv:'name,email,course,completed_at\n秘密氏名,private2@example.com,秘密講座,2026-09-30',issuer:{id:id(),name:'private-issuer'}});
+ await s.validate(b.id);await s.approve(b.id,{approver:'Punka',consentConfirmed:true,issuanceConditionsConfirmed:true,piiReviewed:true});
+ const issued=await s.issue(b.id);const cert=issued.certificates[0].certificate_id;
+ for(const bot of bots)for(const tool of allowedTools(bot).filter(n=>['get_certificate_status','get_proof_status','get_certificate_proof_status','get_verify_preview'].includes(n))){
+  const text=await (await req(`/mcp/${bot.path}`,bindings[bot.secret],call(tool,{certificate_id:cert}))).text();
+  for(const pii of ['秘密氏名','private2@example.com','秘密講座','private-issuer','document_json','recipient_id','email'])expect(text).not.toContain(pii);
+  expect(text).toContain(cert);
+ }
+});

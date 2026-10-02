@@ -1,0 +1,66 @@
+import {env,applyD1Migrations} from 'cloudflare:test';
+import {beforeAll,describe,it,expect,vi} from 'vitest';
+import worker from '../src/index';
+import {parseCSV,sha256,canonicalPayload,displayStatus,id,now} from '../src/domain';
+import {ProofService,type Bindings} from '../src/service';
+const bindings={...env,APP_ORIGIN:'http://localhost:8787',RP_ID:'localhost',OPERATOR_TOKEN:'operator-secret',PUNKA_APPROVAL_TOKEN:'punka-secret',PROOF_VERIFIER_TOKEN:'verifier-secret',BITCOIN_RPC_URL:'http://localhost:8332'} as Bindings;
+const service=new ProofService(bindings);
+const issuer={id:id(),name:'テスト講座運営'};
+const csv='name,email,course,completed_at\n山田太郎,taro@example.com,Python基礎講座,2026-09-30';
+const compliance={approver:'Punka',consentConfirmed:true,issuanceConditionsConfirmed:true,piiReviewed:true};
+async function request(path:string,method='GET',body?:unknown,token?:string,cookie?:string,origin?:string){
+ const headers=new Headers();if(token)headers.set('Authorization',`Bearer ${token}`);if(cookie)headers.set('Cookie',cookie);if(body!==undefined)headers.set('Content-Type','application/json');if(origin)headers.set('Origin',origin);
+ return worker.fetch(new Request('http://localhost:8787'+path,{method,headers,...(body!==undefined?{body:JSON.stringify(body)}:{})}),bindings);
+}
+beforeAll(async()=>{await applyD1Migrations(env.DB,(env as unknown as {TEST_MIGRATIONS:Parameters<typeof applyD1Migrations>[1]}).TEST_MIGRATIONS);});
+describe('CSV',()=>{
+ it('正常CSVと引用符・BOMを読み込む',()=>{expect(parseCSV(csv)[0].errors).toEqual([]);expect(parseCSV('\uFEFFname,email,course,completed_at\r\n"山田,太郎",taro@example.com,"Python,基礎",2026-09-30\r\n')[0].name).toBe('山田,太郎');});
+ it('必須列不足・重複ヘッダを拒否',()=>{expect(()=>parseCSV('name,email,course\na,b,c')).toThrow();expect(()=>parseCSV('name,email,course,course\na,b,c,d')).toThrow();});
+ it('不正emailを検出',()=>expect(parseCSV(csv.replace('taro@example.com','invalid'))[0].errors.join()).toContain('email'));
+ it('実在しない日付を検出',()=>expect(parseCSV(csv.replace('2026-09-30','2026-02-30'))[0].errors.join()).toContain('completed_at'));
+ it('同一人物講座の重複を検出',()=>expect(parseCSV(csv+'\n山田太郎,TARO@example.com,Python基礎講座,2026-08-31')[1].errors.join()).toContain('重複'));
+ it('空行・不正文字・最大文字数を検査',()=>{expect(parseCSV(csv+'\n\n他人,a@example.com,講座,2026-01-01')[1].errors.join()).toContain('空行');expect(parseCSV(csv.replace('山田太郎','山田\u0000'))[0].errors.length).toBeGreaterThan(0);expect(parseCSV(csv.replace('山田太郎','山'.repeat(101)))[0].errors.length).toBeGreaterThan(0);});
+});
+let batchId:string,publicId:string,recipientId:string,proofId:string;
+describe('Issuance / Authorization / Proof / Verify',()=>{
+ it('登録・source hash・同一CSV再投入を拒否',async()=>{const response=await request('/api/issuance-batches','POST',{filename:'graduates.csv',csv,issuer},'operator-secret');expect(response.status).toBe(201);const data=await response.json() as {id:string;source_hash:string};batchId=data.id;expect(data.source_hash).toBe(await sha256(csv));expect((await request('/api/issuance-batches','POST',{filename:'renamed.csv',csv,issuer},'operator-secret')).status).toBe(409);});
+ it('承認前発行不可・一般利用者とBotは承認不可',async()=>{expect((await request(`/api/issuance-batches/${batchId}/issue`,'POST',{},'punka-secret')).status).toBe(409);expect((await request(`/api/issuance-batches/${batchId}/approve`,'POST',compliance,'operator-secret')).status).toBe(403);expect((await request(`/api/issuance-batches/${batchId}/approve`,'POST',compliance,undefined,undefined,bindings.APP_ORIGIN)).status).toBe(403);});
+ it('検査後Punka承認で発行・再発行は冪等',async()=>{expect((await request(`/api/issuance-batches/${batchId}/validate`,'POST',{},'operator-secret')).status).toBe(200);expect((await request(`/api/issuance-batches/${batchId}/approve`,'POST',compliance,'punka-secret')).status).toBe(200);const response=await request(`/api/issuance-batches/${batchId}/issue`,'POST',{},'punka-secret');expect(response.status).toBe(200);const data=await response.json() as {status:string;certificates:{certificate_id:string}[]};expect(data.status).toBe('COMPLETED');expect(data.certificates).toHaveLength(1);publicId=data.certificates[0].certificate_id;expect(publicId).toMatch(/^[a-f0-9-]{36}$/);const cert=await service.certificate(publicId);recipientId=cert.recipient_id;proofId=(await service.sql('SELECT id FROM timestamp_proofs WHERE certificate_id=?',cert.id).first<{id:string}>())!.id;expect((await request(`/api/issuance-batches/${batchId}/issue`,'POST',{},'punka-secret')).status).toBe(200);});
+ it('public Verifyは匿名アクセス可・PIIは非公開・pendingをconfirmedにしない',async()=>{const response=await request(`/api/verify/${publicId}`);expect(response.status).toBe(200);const data=await response.json() as Record<string,unknown>;expect(data.status).toBe('PENDING');expect(data.proof_status).toBe('pending');expect(data.display).toEqual(displayStatus('PENDING'));const text=JSON.stringify(data);expect(text).not.toContain('email');expect(text).not.toContain('taro@example.com');expect(text).not.toContain('山田太郎');});
+ it('本人のみMy Certificateを取得・他人と未認証は不可',async()=>{const ownToken=id();await service.sql('INSERT INTO sessions VALUES(?,?,?)',await sha256(ownToken),recipientId,new Date(Date.now()+60000).toISOString()).run();const cookie=`punka_session=${ownToken}`;expect((await request(`/api/my/certificates/${publicId}`,'GET',undefined,undefined,cookie)).status).toBe(200);expect((await request(`/api/my/certificates/${publicId}`)).status).toBe(401);const other=id();await service.sql('INSERT INTO users(id,created_at) VALUES(?,?)',other,now()).run();const token=id();await service.sql('INSERT INTO sessions VALUES(?,?,?)',await sha256(token),other,new Date(Date.now()+60000).toISOString()).run();expect((await request(`/api/my/certificates/${publicId}`,'GET',undefined,undefined,`punka_session=${token}`)).status).toBe(404);const data=await (await request('/api/my/certificates','GET',undefined,undefined,`punka_session=${token}`)).json() as {certificates:unknown[]};expect(data.certificates).toEqual([]);});
+ it('証明payloadは指定の6項目のみ・document commitmentは検査可能',async()=>{const c=await service.certificate(publicId);const payload=JSON.parse(canonicalPayload(c,'ACTIVE'));expect(Object.keys(payload).sort()).toEqual(['certificateId','courseId','documentHash','issuedAt','issuerId','status']);const document=await service.sql('SELECT document_json FROM certificates WHERE id=?',c.id).first<{document_json:string}>();expect(await sha256(document!.document_json)).toBe(c.document_hash);});
+ it('proof失敗しても証明書・監査を保持',async()=>{expect((await request(`/api/internal/proofs/${proofId}`,'POST',{status:'failed'},'verifier-secret')).status).toBe(200);expect((await service.certificate(publicId)).status).toBe('PENDING');expect((await service.publicCertificate(publicId)).proof_status).toBe('failed');});
+ it('確認に証拠を要求・一般利用者はproofを変更不可',async()=>{expect((await request(`/api/internal/proofs/${proofId}`,'POST',{status:'confirmed'},'verifier-secret')).status).toBe(400);expect((await request(`/api/internal/proofs/${proofId}`,'POST',{status:'confirmed',receipt:'',bitcoinBlock:900000},'operator-secret')).status).toBe(403);});
+ it('pending OTSと不一致hashはconfirmed不可',async()=>{
+  const p=await service.sql('SELECT payload_hash FROM timestamp_proofs WHERE id=?',proofId).first<{payload_hash:string}>();
+  const header=Buffer.from('004f70656e54696d657374616d7073000050726f6f6600bf89e2e884e89294','hex');
+  const pending=Buffer.concat([header,Buffer.from([1,8]),Buffer.from(p!.payload_hash,'hex'),Buffer.from([0]),Buffer.from('83dfe30d2ef90c8e','hex'),Buffer.from([2,1,97])]).toString('base64');
+  expect((await request(`/api/internal/proofs/${proofId}`,'POST',{status:'confirmed',receipt:pending,bitcoinBlock:900000},'verifier-secret')).status).toBe(400);
+  expect((await service.certificate(publicId)).status).toBe('PENDING');
+ });
+ it('Bitcoin RPCのmainnet・Merkle root・6 confirmations照合後ACTIVE → VALID',async()=>{
+  const p=await service.sql('SELECT payload_hash FROM timestamp_proofs WHERE id=?',proofId).first<{payload_hash:string}>();
+  const height=900000;const varint=[];let n=height;do{const b=n&127;n=Math.floor(n/128);varint.push(b|(n?128:0));}while(n);
+  const receipt=Buffer.concat([Buffer.from('004f70656e54696d657374616d7073000050726f6f6600bf89e2e884e89294','hex'),Buffer.from([1,8]),Buffer.from(p!.payload_hash,'hex'),Buffer.from([0]),Buffer.from('0588960d73d71901','hex'),Buffer.from([varint.length,...varint])]).toString('base64');
+  let valid=false;
+  const mocked=vi.spyOn(globalThis,'fetch').mockImplementation(async(_url,init)=>{
+   const data=JSON.parse(init!.body as string);
+   const result=data.method==='getblockhash'?(data.params[0]===0?'000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f':'block-hash'):{height,confirmations:6,merkleroot:valid?Buffer.from(p!.payload_hash,'hex').reverse().toString('hex'):'wrong-root'};
+   return Response.json({result,error:null});
+  });
+  try {
+   expect((await request(`/api/internal/proofs/${proofId}`,'POST',{status:'confirmed',receipt,bitcoinBlock:height},'verifier-secret')).status).toBe(400);
+   valid=true;expect((await request(`/api/internal/proofs/${proofId}`,'POST',{status:'confirmed',receipt,bitcoinBlock:height},'verifier-secret')).status).toBe(200);
+  } finally {mocked.mockRestore();}
+  const data=await service.publicCertificate(publicId);expect(data.status).toBe('ACTIVE');expect(data.display.label).toBe('VALID');expect(data.proof_status).toBe('confirmed');
+ });
+ it('証明書ID重複・譲渡・物理削除をDBでも拒否',async()=>{const c=await service.certificate(publicId);await expect(bindings.DB.batch([service.sql("UPDATE issuance_batches SET status='ISSUING' WHERE id=?",batchId),service.sql("INSERT INTO certificates(id,title,certificate_type,sha256,created_at,certificate_id,batch_id) VALUES(?,?,?,?,?,?,?)",id(),'duplicate','completion','hash',now(),publicId,batchId)])).rejects.toThrow('UNIQUE');await expect(service.sql('UPDATE certificates SET recipient_id=? WHERE id=?',id(),c.id).run()).rejects.toThrow();await expect(service.sql('DELETE FROM certificates WHERE id=?',c.id).run()).rejects.toThrow();await expect(service.sql('UPDATE certificates SET certificate_id=? WHERE id=?',publicId,c.id).run()).rejects.toThrow();});
+ it('新CSVで同じ受講者講座を発行不可',async()=>{const b=await service.import({filename:'again.csv',csv:csv+'\n',issuer});const result=await service.validate((b as {id:string}).id);expect(result.status).toBe('FAILED');});
+ it('一般利用者とoperatorは失効不可・Punka失効後REVOKED',async()=>{const data={approver:'Punka',reason:'発行条件の訂正',revocationConditionsConfirmed:true};expect((await request(`/api/certificates/${publicId}/revoke`,'POST',data,'operator-secret')).status).toBe(403);expect((await request(`/api/certificates/${publicId}/revoke`,'POST',data,undefined,undefined,bindings.APP_ORIGIN)).status).toBe(403);expect((await request(`/api/certificates/${publicId}/revoke`,'POST',data,'punka-secret')).status).toBe(200);const c=await service.publicCertificate(publicId);expect(c.status).toBe('REVOKED');expect(c.display.label).toBe('REVOKED');expect(c.proof_status).toBe('pending');expect(c.proofs).toHaveLength(2);const original=await service.certificate(publicId);await expect(service.sql("UPDATE certificates SET status='ACTIVE' WHERE id=?",original.id).run()).rejects.toThrow();expect((await service.sql('SELECT action FROM audit_logs WHERE target_id=?',publicId).all()).results.map(r=>r.action)).toContain('CERTIFICATE_REVOKED');});
+ it('不存在ID → 404・CSRF origin mismatch拒否',async()=>{expect((await request(`/api/verify/${id()}`)).status).toBe(404);expect((await request('/api/auth/logout','POST',{},undefined,undefined,'https://evil.example')).status).toBe(403);});
+ it('既存Creator Trace rowを保存可能',async()=>{await service.sql('INSERT INTO certificates(id,title,certificate_type,sha256,created_at) VALUES(?,?,?,?,?)',id(),'legacy','creator','legacy-hash',now()).run();expect((await service.sql("SELECT id FROM certificates WHERE title='legacy'").all()).results).toHaveLength(1);});
+});
+describe('Passkey failures',()=>{
+ it('招待なし/偽造招待登録不可',async()=>{expect((await request('/api/auth/passkey/register/options','POST',{invite:'a'.repeat(64),consent:true},undefined,undefined,bindings.APP_ORIGIN)).status).toBe(403);});
+ it('チャレンジを一回だけ消費・失敗も監査',async()=>{const options=await request('/api/auth/passkey/login/options','POST',{},undefined,undefined,bindings.APP_ORIGIN);expect(options.status).toBe(200);const challengeCookie=options.headers.get('Set-Cookie')!.split(';')[0];const response=await request('/api/auth/passkey/login/verify','POST',{response:{}},undefined,challengeCookie,bindings.APP_ORIGIN);expect(response.status).toBe(400);expect((await request('/api/auth/passkey/login/verify','POST',{response:{}},undefined,challengeCookie,bindings.APP_ORIGIN)).status).toBe(400);expect((await service.sql("SELECT id FROM audit_logs WHERE action='LOGIN_FAILED'").all()).results.length).toBeGreaterThan(0);});
+});

@@ -1,0 +1,11 @@
+# Three separate random secrets. Only Punka holds the approval secret.
+OPERATOR_TOKEN=replace-with-random-operator-token
+PUNKA_APPROVAL_TOKEN=replace-with-random-human-token
+PROOF_VERIFIER_TOKEN=replace-with-random-isolated-verifier-token
+
+# Five independent MCP-only tokens; never reuse administrative tokens.
+MCP_TACHIBANA_TOKEN=replace-with-random-tachibana-token
+MCP_SANADA_TOKEN=replace-with-random-sanada-token
+MCP_MIDO_TOKEN=replace-with-random-mido-token
+MCP_SHIRAISHI_TOKEN=replace-with-random-shiraishi-token
+MCP_MIZUKI_TOKEN=replace-with-random-mizuki-token

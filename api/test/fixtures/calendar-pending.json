@@ -1,0 +1,6 @@
+{
+  "payload": "{\"certificateId\":\"00000000-0000-4000-8000-000000000001\",\"courseId\":\"00000000-0000-4000-8000-000000000002\",\"documentHash\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"issuedAt\":\"2026-09-30T00:00:00.000Z\",\"issuerId\":\"00000000-0000-4000-8000-000000000003\",\"status\":\"ACTIVE\"}",
+  "payloadHash": "ce6c3ffe7e6cee2de0a69008ee81e5a561506170e439502ec53293799e3e62a8",
+  "source": "https://a.pool.opentimestamps.org",
+  "note": "Live OTS calendar receipt for public synthetic payload; not Bitcoin-confirmed."
+}

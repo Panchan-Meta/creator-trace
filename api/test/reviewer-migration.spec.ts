@@ -1,0 +1,14 @@
+import {env,applyD1Migrations} from 'cloudflare:test';
+import {it,expect} from 'vitest';
+import {id,now} from '../src/domain';
+it('旧Reviewerの承認・差戻し履歴をそのまま保持し、migration後も旧判断を保持しReviewerのFINALだけ禁止する',async()=>{
+ const migrations=(env as unknown as {TEST_MIGRATIONS:Parameters<typeof applyD1Migrations>[1]}).TEST_MIGRATIONS;await applyD1Migrations(env.DB,migrations.slice(0,15));
+ const owner=id(),reviewer=id(),project=id(),asset=id(),versions=[id(),id(),id()],time=now();for(const user of [owner,reviewer])await env.DB.prepare('INSERT INTO users(id,display_name,created_at) VALUES(?,?,?)').bind(user,'Legacy reviewer',time).run();
+ await env.DB.prepare('INSERT INTO projects(id,name,owner_id,created_at) VALUES(?,?,?,?)').bind(project,'Legacy review project',owner,time).run();await env.DB.prepare('INSERT INTO project_members(id,project_id,user_id,role,status,created_at) VALUES(?,?,?,?,?,?)').bind(id(),project,reviewer,'REVIEWER','ACTIVE',time).run();await env.DB.prepare('INSERT INTO assets(id,project_id,filename,mime_type,size,created_at,created_by) VALUES(?,?,?,?,?,?,?)').bind(asset,project,'legacy.wav','audio/wav',4,time,owner).run();
+ for(const [i,version] of versions.entries())await env.DB.prepare('INSERT INTO asset_versions(id,asset_id,version,sha256,status,created_by,filename,mime_type,size,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)').bind(version,asset,i+1,'4'.repeat(64),'SUBMITTED',owner,'legacy.wav','audio/wav',4,time).run();
+ for(const [version,status] of [[versions[0],'APPROVED'],[versions[1],'REJECTED']])await env.DB.prepare('UPDATE asset_version_states SET status=?,actor_user_id=?,reason=?,updated_at=? WHERE asset_version_id=?').bind(status,reviewer,'Legacy decision',time,version).run();
+ const tables=['users','project_members','project_member_history','assets','asset_versions','asset_version_states','asset_version_state_history','approvals','audit_events'],before=await Promise.all(tables.map(async t=>(await env.DB.prepare(`SELECT * FROM ${t} ORDER BY 1`).all()).results));await applyD1Migrations(env.DB,migrations);
+ for(const [i,table] of tables.entries())expect((await env.DB.prepare(`SELECT * FROM ${table} ORDER BY 1`).all()).results.map(({name,actor_role,approver_role,...r})=>table==='assets'||table==='asset_version_state_history'||table==='approvals'?r:{...r,...(name!==undefined?{name}:{}),...(actor_role!==undefined?{actor_role}:{}),...(approver_role!==undefined?{approver_role}:{})})).toEqual(before[i]);
+ await expect(env.DB.prepare('UPDATE asset_version_states SET status=?,actor_user_id=?,updated_at=? WHERE asset_version_id=?').bind('FINAL',reviewer,time,versions[0]).run()).rejects.toThrow();
+ expect((await env.DB.prepare('SELECT * FROM approvals WHERE approver_id=?').bind(reviewer).all()).results).toHaveLength(2);
+});

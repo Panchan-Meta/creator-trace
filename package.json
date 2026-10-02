@@ -1,0 +1,25 @@
+{
+  "name": "creator-trace",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "dev": "npm run dev --prefix api",
+    "typecheck": "npm run typecheck --prefix api && npm run typecheck --prefix web && node api/node_modules/typescript/bin/tsc -p e2e/tsconfig.json",
+    "test": "npm test --prefix api",
+    "build": "npm run build --prefix web && npm run build --prefix api",
+    "migrate:local": "wrangler d1 migrations apply creator-trace-db --local --config api/wrangler.jsonc",
+    "setup:local": "node scripts/setup-local.cjs",
+    "test:e2e": "playwright test",
+    "account:create": "node scripts/create-owner.cjs"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "devDependencies": {
+    "@playwright/test": "^1.63.0",
+    "jsqr": "^1.4.0",
+    "wrangler": "^4.145.0"
+  }
+}

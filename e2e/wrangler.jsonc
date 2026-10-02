@@ -1,0 +1,10 @@
+{
+ "name":"punka-proof-e2e-only",
+ "main":"../api/src/index.ts",
+ "compatibility_date":"2026-09-29",
+ "compatibility_flags":["nodejs_compat"],
+ "d1_databases":[{"binding":"DB","database_name":"punka-e2e","database_id":"00000000-0000-0000-0000-000000000001","migrations_dir":"../migrations"}],
+ "r2_buckets":[{"binding":"PROOFS","bucket_name":"punka-e2e"}],
+ "assets":{"directory":"../web/dist","binding":"ASSETS","not_found_handling":"single-page-application","run_worker_first":["/api/*","/mcp/*","/admin/*"]},
+ "vars":{"APP_ORIGIN":"http://localhost:8791","RP_ID":"localhost","SIGNUP_ENABLED":"true","OPERATOR_TOKEN":"e2e-operator-only","PUNKA_APPROVAL_TOKEN":"e2e-human-only","PROOF_VERIFIER_TOKEN":"e2e-verifier-only"}
+}

@@ -1,0 +1,36 @@
+import {test,expect} from '@playwright/test';
+import {randomUUID} from 'node:crypto';
+import jsQR from 'jsqr';
+import {installAuthenticator} from './authenticator';
+test('Firefox: CSV→検査→Punka承認→Verify、署名Passkey→本人一覧→詳細、失効→REVOKED',async({page,request})=>{
+ const errors:string[]=[];page.on('pageerror',e=>errors.push(e.message));
+ const operator={Authorization:'Bearer e2e-operator-only'},human={Authorization:'Bearer e2e-human-only'};
+ const course=`Firefox講座 ${randomUUID()}`;
+ const imported=await request.post('/api/issuance-batches',{headers:operator,data:{filename:'firefox.csv',issuer:{id:randomUUID(),name:'Punka E2E'},csv:`name,email,course,completed_at\n受講者,test-${randomUUID()}@example.com,${course},2026-09-30`}});expect(imported.status()).toBe(201);const batch=(await imported.json()).id;
+ expect((await request.post(`/api/issuance-batches/${batch}/issue`,{headers:human,data:{}})).status()).toBe(409);
+ expect((await request.post(`/api/issuance-batches/${batch}/validate`,{headers:operator,data:{}})).status()).toBe(200);
+ expect((await request.post(`/api/issuance-batches/${batch}/approve`,{headers:human,data:{approver:'Punka',consentConfirmed:true,issuanceConditionsConfirmed:true,piiReviewed:true}})).status()).toBe(200);
+ const issued=await request.post(`/api/issuance-batches/${batch}/issue`,{headers:human,data:{}});expect(issued.status()).toBe(200);const cert=(await issued.json()).certificates[0].certificate_id;
+ await page.goto(`/verify/${cert}`);await expect(page.locator('.badge')).toHaveText('! PENDING');await expect(page.getByRole('heading',{name:course})).toBeVisible();await expect(page.locator('canvas')).toHaveAttribute('aria-label','この修了証の公開Verify URLのQRコード');expect(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth)).toBe(true);
+ const pixels=await page.locator('canvas').evaluate((canvas:HTMLCanvasElement)=>{const image=canvas.getContext('2d')!.getImageData(0,0,canvas.width,canvas.height);return {width:canvas.width,height:canvas.height,data:[...image.data]};});
+ const decoded=jsQR(new Uint8ClampedArray(pixels.data),pixels.width,pixels.height);expect(decoded?.data).toBe(`http://localhost:8791/verify/${cert}`);
+ const verification=await (await request.get(`/api/verify/${cert}`)).json();expect(verification).not.toHaveProperty('email');expect(JSON.stringify(verification)).not.toContain('@example.com');
+ const outbox=await (await request.get('/api/internal/notifications',{headers:operator})).json();const notice=outbox.find((n:any)=>n.verify_url.endsWith(cert));expect(notice).toBeTruthy();
+ await installAuthenticator(page);
+ await page.goto(notice.registration_url);await page.getByRole('checkbox').check();await page.getByRole('button',{name:'パスキーを登録する'}).click();await page.waitForURL('**/settings/security*');await expect(page.getByText('パスキーを登録しました',{exact:true})).toBeVisible();
+ await expect(page.getByText('登録済みパスキー：1件')).toBeVisible();
+ await page.getByRole('button',{name:'パスキーを登録する'}).click();await expect(page.getByText('登録済みパスキー：2件')).toBeVisible();await expect(page.getByText('パスキーを登録しました',{exact:true})).toBeVisible();
+ await page.getByRole('button',{name:'ログアウト'}).click();await page.waitForURL('**/login');await page.getByRole('button',{name:'パスキーでログイン'}).click();await page.waitForURL('**/my-certificates');await page.getByRole('link',{name:'詳細',exact:true}).click();await expect(page.getByRole('heading',{name:'自分の修了証',exact:true})).toBeVisible();await page.getByRole('link',{name:'公開Verify',exact:true}).click();await expect(page.locator('.badge')).toHaveText('! PENDING');
+ expect((await request.post(`/api/certificates/${cert}/revoke`,{headers:human,data:{approver:'Punka',reason:'E2E失効',revocationConditionsConfirmed:true}})).status()).toBe(200);
+ await page.reload();await expect(page.locator('.badge')).toHaveText('× REVOKED');await expect(page.getByText('この修了証は失効しています')).toBeVisible();await page.screenshot({path:'test-results/firefox-revoked-mobile.png',fullPage:true});
+ await page.setViewportSize({width:1280,height:900});await page.reload();await expect(page.locator('.badge')).toHaveText('× REVOKED');expect(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth)).toBe(true);
+ // ACTIVE display is tested with a browser response fixture; no test-only activation API exists.
+ await page.route(`**/api/verify/${cert}`,route=>route.fulfill({json:{...verification,status:'ACTIVE',proof_status:'confirmed',display:{label:'VALID',symbol:'✓',message:'この修了証は有効です'}}}));await page.reload();await expect(page.locator('.badge')).toHaveText('✓ VALID');
+ expect(errors).toEqual([]);
+});
+
+test('Firefox: 公開データのHTMLはテキストとして表示される',async({page})=>{
+ const text='<img src=x onerror=alert(1)>';
+ await page.route('**/api/verify/xss-fixture',route=>route.fulfill({json:{certificate_id:'xss-fixture',issuer:'<script>alert(1)</script>',course:text,completed_at:'2026-09-30',issued_at:'2026-10-01T00:00:00Z',status:'PENDING',display:{label:'PENDING',symbol:'!',message:'証明処理を確認中です'},document_hash:'a'.repeat(64),proof_status:'pending',last_checked_at:'2026-10-01T00:00:00Z',verify_url:'http://localhost:8791/verify/xss-fixture',revoked_at:null}}));
+ await page.goto('/verify/xss-fixture');await expect(page.getByRole('heading',{name:text})).toBeVisible();await expect(page.locator('main img')).toHaveCount(0);await expect(page.locator('main script')).toHaveCount(0);
+});
